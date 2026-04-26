@@ -18,6 +18,7 @@
 #include <freertos/FreeRTOS.h>
 #include <esp_sleep.h>
 #include <esp_ota_ops.h>
+#include <driver/rtc_io.h>
 #include "config.h"
 #include "fsd_handler.h"
 #include "can_driver.h"
@@ -55,6 +56,14 @@ static void apply_detected_hw(TeslaHWVersion hw, const char *reason) {
         state_exit();
         return;
     }
+    // If the user has pinned a HW version via the dashboard, ignore auto-
+    // detect updates. Useful when the OBD-II Party CAN tap doesn't carry
+    // 0x398 and the 0x399-fallback misclassifies the car.
+    if (g_state.hw_override != TeslaHW_Unknown) {
+        state_exit();
+        Serial.printf("[HW] Auto-detect %s ignored (override pinned)\n", reason);
+        return;
+    }
     fsd_apply_hw_version(&g_state, hw);
     state_exit();
 
@@ -76,9 +85,26 @@ static bool     g_factory_reset_window   = false;  // set true on clean boot, cl
 static bool     g_factory_reset_eligible = false;  // latched at leading edge if press was in window
 static bool     g_factory_reset_armed    = false;  // blink done, waiting for release
 
-#if defined(BOARD_LILYGO)
+#if defined(SLEEP_STRATEGY_EXT0) || defined(SLEEP_STRATEGY_TIMER)
 static uint32_t g_last_can_rx_ms = 0;
 static bool     g_sleep_warned   = false;
+#endif
+#if defined(SLEEP_STRATEGY_TIMER)
+// True for the brief listen window after a timer wake. Cleared on the first
+// CAN frame seen, so the device stays awake whenever the car is alive.
+static bool     g_probe_mode     = false;
+// Track whether WiFi/dashboard were started this boot, so the lazy starter
+// (called from setup or after a successful probe) is idempotent. RAM is wiped
+// on deep sleep, so this is naturally false on every wake.
+static bool     g_wifi_started   = false;
+
+static void start_wifi_lazy() {
+    if (g_wifi_started) return;
+    g_wifi_started = true;
+    if (wifi_ap_init(&g_state)) {
+        web_dashboard_init(&g_state, g_can, &g_state_mux);
+    }
+}
 #endif
 
 static void dispatch_clicks(int n) {
@@ -128,6 +154,17 @@ static void button_tick() {
         g_btn_down_ms          = now;
         g_long_fired           = false;
         g_factory_reset_eligible = g_factory_reset_window;  // latch at press time
+#if defined(SLEEP_STRATEGY_TIMER)
+        // A button press during a post-wake probe is deliberate user intent;
+        // clear probe mode so the normal sleep_idle_ms threshold takes over
+        // and the device doesn't immediately re-sleep on probe expiry.
+        if (g_probe_mode) {
+            g_probe_mode = false;
+            g_last_can_rx_ms = now;  // restart the sleep clock from this press
+            Serial.println("[WAKE] Button press during probe — staying awake");
+            start_wifi_lazy();
+        }
+#endif
     }
 
     if (g_btn_down && pressed && !g_long_fired) {
@@ -184,9 +221,15 @@ static void update_led() {
         led_set(LED_WHITE);
         return;
     }
+#if defined(SLEEP_STRATEGY_TIMER)
+    if (g_probe_mode) {
+        led_set(LED_SLEEP);  // dim white while listening for CAN after timer wake
+        return;
+    }
+#endif
     if (s.rx_count == 0 && millis() > WIRING_WARN_MS) {
         led_set(LED_RED);
-    } else if (s.tesla_ota_in_progress) {
+    } else if (s.tesla_ota_in_progress && !s.ota_ignore) {
         led_set(LED_YELLOW);
     } else if (s.op_mode == OpMode_Active) {
         led_set(LED_GREEN);
@@ -202,16 +245,69 @@ static void process_frame(const CanFrame &frame) {
     if (frame.id == CAN_ID_GTW_CAR_STATE)  g_state.seen_gtw_car_state++;
     if (frame.id == CAN_ID_GTW_CAR_CONFIG) g_state.seen_gtw_car_config++;
     if (frame.id == CAN_ID_AP_CONTROL)     g_state.seen_ap_control++;
+    if (frame.id == CAN_ID_FOLLOW_DIST)    g_state.seen_follow_dist++;
     if (frame.id == CAN_ID_BMS_HV_BUS)     g_state.seen_bms_hv++;
     if (frame.id == CAN_ID_BMS_SOC)        g_state.seen_bms_soc++;
     if (frame.id == CAN_ID_BMS_THERMAL)    g_state.seen_bms_thermal++;
+
+    // ── CAN serial trace: track last-seen bytes per unique ID. ──────────────
+    // Mutates g_state.trace_* under the lock; the serial print happens
+    // outside the lock so it never stalls higher-priority CAN handling.
+    bool trace_changed = false;
+    bool trace_armed   = g_state.can_trace;
+    uint8_t trace_dlc  = 0;
+    {
+        int slot = -1;
+        for (uint16_t i = 0; i < g_state.trace_count; i++) {
+            if (g_state.trace_ids[i] == (uint16_t)frame.id) { slot = (int)i; break; }
+        }
+        if (slot < 0 && g_state.trace_count < TRACE_MAX) {
+            slot = g_state.trace_count++;
+            g_state.trace_ids[slot] = (uint16_t)frame.id;
+            // Fresh slot starts with sentinel so the first frame of a new ID
+            // doesn't register as a change and spam serial when trace is on.
+            g_state.trace_dlc[slot] = 0xFF;
+        }
+        if (slot >= 0) {
+            uint8_t dlc = frame.dlc < 8 ? frame.dlc : 8;
+            bool changed = (g_state.trace_dlc[slot] != 0xFF) &&
+                           (g_state.trace_dlc[slot] != dlc);
+            for (uint8_t i = 0; i < dlc; i++) {
+                if (g_state.trace_dlc[slot] != 0xFF &&
+                    g_state.trace_bytes[slot][i] != frame.data[i]) changed = true;
+                g_state.trace_bytes[slot][i] = frame.data[i];
+            }
+            g_state.trace_dlc[slot] = dlc;
+            trace_changed = changed;
+            trace_dlc     = dlc;
+        }
+    }
     state_exit();
 
     can_dump_record(frame);
-#if defined(BOARD_LILYGO)
+#if defined(SLEEP_STRATEGY_EXT0) || defined(SLEEP_STRATEGY_TIMER)
     g_last_can_rx_ms = millis();
     g_sleep_warned   = false;
+  #if defined(SLEEP_STRATEGY_TIMER)
+    if (g_probe_mode) {
+        g_probe_mode = false;
+        Serial.println("[WAKE] CAN traffic detected — staying awake");
+        start_wifi_lazy();
+    }
+  #endif
 #endif
+
+    if (trace_armed && trace_changed) {
+        // Backpressure guard: if the UART TX FIFO doesn't have room for a
+        // full line (~40 chars), drop this print rather than block. Without
+        // USB connected the FIFO fills fast and Serial.printf would stall
+        // web_dashboard_update.
+        if (Serial.availableForWrite() >= 40) {
+            Serial.printf("[TRACE] 0x%03X dlc=%u:", (unsigned)frame.id, trace_dlc);
+            for (uint8_t i = 0; i < trace_dlc; i++) Serial.printf(" %02X", frame.data[i]);
+            Serial.println();
+        }
+    }
 
     // DLC sanity: skip zero-length frames
     if (frame.dlc == 0) return;
@@ -248,8 +344,17 @@ static void process_frame(const CanFrame &frame) {
     if (frame.id == CAN_ID_BMS_SOC)     { state_enter(); fsd_handle_bms_soc(&g_state, &frame);     state_exit(); return; }
     if (frame.id == CAN_ID_BMS_THERMAL) { state_enter(); fsd_handle_bms_thermal(&g_state, &frame); state_exit(); return; }
 
-    // ── DAS status (read-only, always) — gating for NAG killer ───────────────
+    // ── DAS status (read-only, always) — gating for NAG killer + diagnostics ─
     if (frame.id == CAN_ID_DAS_STATUS)  { state_enter(); fsd_handle_das_status(&g_state, &frame);  state_exit(); return; }
+
+    // ── Vehicle dynamics (read-only, always) ─────────────────────────────────
+    if (frame.id == CAN_ID_DI_SPEED)    { state_enter(); fsd_handle_di_speed(&g_state, &frame);          state_exit(); return; }
+    if (frame.id == CAN_ID_ESP_STATUS)  { state_enter(); fsd_handle_esp_status(&g_state, &frame);        state_exit(); return; }
+    if (frame.id == CAN_ID_DI_TORQUE)   { state_enter(); fsd_handle_di_torque(&g_state, &frame);         state_exit(); return; }
+    if (frame.id == CAN_ID_STEER_ANGLE) { state_enter(); fsd_handle_steering_angle(&g_state, &frame);    state_exit(); return; }
+    if (frame.id == CAN_ID_BATT_STATUS) { state_enter(); fsd_handle_batt_status_chassis(&g_state, &frame); state_exit(); return; }
+    if (frame.id == CAN_ID_BATT_TEMP)   { state_enter(); fsd_handle_batt_temp(&g_state, &frame);         state_exit(); return; }
+    if (frame.id == CAN_ID_DC_BUS)      { state_enter(); fsd_handle_dc_bus(&g_state, &frame);            state_exit(); return; }
 
     // ── Beyond here only run when TX is allowed ───────────────────────────────
     state_enter();
@@ -333,8 +438,12 @@ static void process_frame(const CanFrame &frame) {
         return;
     }
 
-    // TLSSC Restore (0x331) — DAS config spoof
+    // TLSSC Restore (0x331) — DAS config spoof + DAS_autopilot tier readback
     if (frame.id == CAN_ID_DAS_AP_CONFIG) {
+        // Always parse the readback first so the dashboard reflects the
+        // car's reported tier even when TLSSC restore is disabled.
+        fsd_handle_das_ap_config(&g_state, &frame);
+        g_state.seen_das_ap_config++;
         CanFrame f = frame;
         state_enter();
         bool modified = fsd_handle_tlssc_restore(&g_state, &f);
@@ -354,15 +463,15 @@ static void process_frame(const CanFrame &frame) {
     }
 }
 
-#if defined(BOARD_LILYGO)
-// ── Deep-sleep watchdog (Lilygo only) ────────────────────────────────────────
+#if defined(SLEEP_STRATEGY_EXT0)
+// ── Deep-sleep watchdog (EXT0 wake on CAN_RX edge) ───────────────────────────
 static void sleep_tick(uint32_t now) {
     if (now < g_last_can_rx_ms) return;
     uint32_t idle_ms = now - g_last_can_rx_ms;
     FSDState s = state_snapshot();
 
     if (idle_ms >= s.sleep_idle_ms) {
-        Serial.printf("[SLEEP] Entering deep sleep after %lu ms CAN silence\n",
+        Serial.printf("[SLEEP] Entering deep sleep (EXT0 wake) after %lu ms CAN silence\n",
                       (unsigned long)idle_ms);
         can_dump_stop();
         sd_syslog_close();
@@ -377,12 +486,53 @@ static void sleep_tick(uint32_t now) {
                       (unsigned long)idle_ms, (unsigned long)remaining_ms);
     }
 }
+#elif defined(SLEEP_STRATEGY_TIMER)
+// ── Deep-sleep watchdog (timer wake + post-wake CAN probe) ───────────────────
+// In probe mode the threshold is the short SLEEP_PROBE_MS window; once a CAN
+// frame arrives the probe flag clears and we revert to the user-configured
+// sleep_idle_ms (driven from the web dashboard slider).
+static void sleep_tick(uint32_t now) {
+    if (now < g_last_can_rx_ms) return;
+    uint32_t idle_ms      = now - g_last_can_rx_ms;
+    uint32_t threshold_ms = g_probe_mode ? SLEEP_PROBE_MS : g_state.sleep_idle_ms;
+
+    if (idle_ms >= threshold_ms) {
+        Serial.printf("[SLEEP] Entering deep sleep (timer %us / button wake) after %lu ms idle (%s)\n",
+                      (unsigned)SLEEP_TIMER_WAKE_S, (unsigned long)idle_ms,
+                      g_probe_mode ? "probe miss" : "user threshold");
+        can_dump_stop();
+        led_set(LED_SLEEP);
+        // Wake on button press (active-LOW, EXT0). Timer + EXT0 are
+        // independent wake sources — either fires.
+        // pullup_en/pulldown_dis are no-ops on input-only pins (GPIO 34-39)
+        // which have no internal pulls; those rely on an external pull-up
+        // (e.g. M5Stack ATOM PCB has one on GPIO 39).
+        rtc_gpio_pullup_en((gpio_num_t)PIN_BUTTON);
+        rtc_gpio_pulldown_dis((gpio_num_t)PIN_BUTTON);
+        esp_sleep_enable_ext0_wakeup((gpio_num_t)PIN_BUTTON, 0);
+        esp_sleep_enable_timer_wakeup((uint64_t)SLEEP_TIMER_WAKE_S * 1000000ULL);
+        esp_deep_sleep_start();
+        // never returns
+    } else if (!g_probe_mode && !g_sleep_warned &&
+               idle_ms >= (g_state.sleep_idle_ms - SLEEP_WARN_MS)) {
+        g_sleep_warned = true;
+        uint32_t remaining_ms = g_state.sleep_idle_ms - idle_ms;
+        Serial.printf("[SLEEP] Warning: %lu ms idle, sleeping in %lu ms\n",
+                      (unsigned long)idle_ms, (unsigned long)remaining_ms);
+    }
+}
 #endif
 
 // ── setup ─────────────────────────────────────────────────────────────────────
 void setup() {
-#if defined(BOARD_LILYGO)
+#if defined(SLEEP_STRATEGY_EXT0) || defined(SLEEP_STRATEGY_TIMER)
     g_last_can_rx_ms = millis();
+#endif
+#if defined(SLEEP_STRATEGY_TIMER)
+    // If we just woke via EXT0 the button pin is still held by the RTC IO
+    // subsystem; release it before pinMode() below so digital IO regains
+    // control. Safe no-op when the pin was never in RTC mode (cold boot).
+    rtc_gpio_deinit((gpio_num_t)PIN_BUTTON);
 #endif
     Serial.begin(115200);
     delay(300);
@@ -416,6 +566,8 @@ void setup() {
     Serial.println("[CAN] Driver: ESP32-S3 TWAI (Waveshare ESP32-S3-RS485-CAN)");
   #elif defined(BOARD_LILYGO)
     Serial.println("[CAN] Driver: ESP32 TWAI (LilyGO T-CAN485)");
+  #elif defined(BOARD_M5STACK_ATOM_MATRIX)
+    Serial.println("[CAN] Driver: ESP32 TWAI (M5Stack ATOM Matrix + ATOMIC CAN Base)");
   #else
     Serial.println("[CAN] Driver: ESP32 TWAI (M5Stack ATOM Lite + ATOMIC CAN Base)");
   #endif
@@ -437,7 +589,15 @@ void setup() {
     Serial.printf("[CFG] pins: LED=%d BUTTON=%d CAN_TX=%d CAN_RX=%d\n",
                   PIN_LED, PIN_BUTTON, PIN_CAN_TX, PIN_CAN_RX);
 
+    // ESP32 input-only pins (GPIO 34-39) have no internal pulls; the M5Stack
+    // ATOM Matrix wires the front button to GPIO 39 with an external pull-up
+    // on the PCB, so plain INPUT is correct. All other supported boards wire
+    // the button to a regular GPIO with internal pull-up available.
+#if (PIN_BUTTON >= 34 && PIN_BUTTON <= 39)
+    pinMode(PIN_BUTTON, INPUT);
+#else
     pinMode(PIN_BUTTON, INPUT_PULLUP);
+#endif
     led_init();
 
     fsd_state_init(&g_state, TeslaHW_Unknown);
@@ -451,6 +611,18 @@ void setup() {
     g_state.bms_output            = false;
 
     prefs_load(&g_state);
+
+    // If the user has pinned a HW version, apply it now so subsequent
+    // auto-detect attempts (which run from process_frame) are short-circuited
+    // by apply_detected_hw().
+    if (g_state.hw_override != TeslaHW_Unknown) {
+        fsd_apply_hw_version(&g_state, g_state.hw_override);
+        const char *hw_str =
+            (g_state.hw_override == TeslaHW_HW4)    ? "HW4"    :
+            (g_state.hw_override == TeslaHW_HW3)    ? "HW3"    :
+            (g_state.hw_override == TeslaHW_Legacy) ? "Legacy" : "?";
+        Serial.printf("[HW] Pinned by override: %s (auto-detect disabled)\n", hw_str);
+    }
 
     {
         esp_sleep_wakeup_cause_t wakeup = esp_sleep_get_wakeup_cause();
@@ -468,11 +640,28 @@ void setup() {
 
     can_dump_init();
 
-#if defined(BOARD_LILYGO)
+#if defined(SLEEP_STRATEGY_EXT0)
     {
         esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
         if (cause == ESP_SLEEP_WAKEUP_EXT0) {
             Serial.printf("[WAKE] Woken by CAN activity (EXT0 GPIO %d)\n", PIN_CAN_RX);
+        } else if (cause != ESP_SLEEP_WAKEUP_UNDEFINED) {
+            Serial.printf("[WAKE] Wakeup cause=%d\n", (int)cause);
+        }
+        g_last_can_rx_ms = millis();
+    }
+#elif defined(SLEEP_STRATEGY_TIMER)
+    {
+        esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+        if (cause == ESP_SLEEP_WAKEUP_TIMER) {
+            g_probe_mode = true;
+            Serial.printf("[WAKE] Timer probe — listening %u ms for CAN traffic\n",
+                          (unsigned)SLEEP_PROBE_MS);
+        } else if (cause == ESP_SLEEP_WAKEUP_EXT0) {
+            // Deliberate user wake via the button — skip probe and run
+            // normally. RTC IO has already been released for this pin at the
+            // top of setup() so pinMode could regain control.
+            Serial.printf("[WAKE] Button press (GPIO %d) — staying awake\n", PIN_BUTTON);
         } else if (cause != ESP_SLEEP_WAKEUP_UNDEFINED) {
             Serial.printf("[WAKE] Wakeup cause=%d\n", (int)cause);
         }
@@ -503,9 +692,19 @@ void setup() {
     Serial.println("[LED] Blue=Listen  Green=Active  Yellow=OTA  Red=Error");
 
     // ── WiFi AP + Web dashboard (non-fatal if WiFi fails) ─────────────────────
+    // For TIMER-sleep boards we defer WiFi until the post-wake CAN probe
+    // succeeds — saves ~50 mA × probe duration on every miss while parked.
+#if defined(SLEEP_STRATEGY_TIMER)
+    if (!g_probe_mode) {
+        start_wifi_lazy();
+    } else {
+        Serial.println("[WiFi] Deferred — will start once CAN traffic confirms wake");
+    }
+#else
     if (wifi_ap_init(&g_state)) {
         web_dashboard_init(&g_state, g_can, &g_state_mux);
     }
+#endif
 }
 
 // ── loop ──────────────────────────────────────────────────────────────────────
@@ -585,10 +784,15 @@ void loop() {
     }
 
     // ── Wiring sanity warning ─────────────────────────────────────────────────
+    // Suppressed during a timer-wake probe: silence is the expected case there
+    // and we'd drop straight back to sleep before the user could act on it.
     static uint32_t last_warn_ms = 0;
     s = state_snapshot();
-    if (s.rx_count == 0 && now > WIRING_WARN_MS &&
-        (now - last_warn_ms) >= 2000u) {
+    bool warn_eligible = (s.rx_count == 0 && now > WIRING_WARN_MS);
+#if defined(SLEEP_STRATEGY_TIMER)
+    if (g_probe_mode) warn_eligible = false;
+#endif
+    if (warn_eligible && (now - last_warn_ms) >= 2000u) {
         Serial.println("[WARN] No CAN traffic after 5 s — check wiring");
         Serial.println("[WARN] Verify CAN-H on OBD pin 6, CAN-L on pin 14");
         last_warn_ms = now;
@@ -596,7 +800,7 @@ void loop() {
 
     can_dump_tick(now);
 
-#if defined(BOARD_LILYGO)
+#if defined(SLEEP_STRATEGY_EXT0) || defined(SLEEP_STRATEGY_TIMER)
     sleep_tick(now);
 #endif
 

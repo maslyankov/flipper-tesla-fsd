@@ -26,11 +26,17 @@ void prefs_load(FSDState *state) {
     if (g_prefs.isKey("wsp")) g_prefs.getString("wsp").toCharArray(state->wifi_pass, sizeof(state->wifi_pass));
     state->wifi_hidden = g_prefs.getBool("wsh", false);
 
-    state->op_mode = (OpMode)g_prefs.getUChar("mode", (uint8_t)OpMode_ListenOnly);
-    
-    Serial.printf("[NVS] Loaded: NAG=%d China=%d Chime=%d Sleep=%u SSID=\"%s\" HIDDEN=%d\n",
+    state->op_mode     = (OpMode)g_prefs.getUChar("mode", (uint8_t)OpMode_ListenOnly);
+    state->hw_override = (TeslaHWVersion)g_prefs.getUChar("hwov", (uint8_t)TeslaHW_Unknown);
+    state->ota_ignore  = g_prefs.getBool("otaig", false);
+    // can_trace is intentionally NOT loaded from NVS: it floods serial and
+    // can starve the loop if left on accidentally. It must be re-enabled
+    // from the dashboard each boot.
+
+    Serial.printf("[NVS] Loaded: NAG=%d China=%d Chime=%d Sleep=%u SSID=\"%s\" HIDDEN=%d HWov=%d\n",
                   state->nag_killer, state->china_mode, state->suppress_speed_chime,
-                  state->sleep_idle_ms, state->wifi_ssid, state->wifi_hidden);
+                  state->sleep_idle_ms, state->wifi_ssid, state->wifi_hidden,
+                  (int)state->hw_override);
     g_prefs.end();
 }
 
@@ -60,9 +66,13 @@ void prefs_save(const FSDState *state) {
     g_prefs.putBool("wsh",    state->wifi_hidden);
 
     g_prefs.putUChar("mode",  (uint8_t)state->op_mode);
-    
-    Serial.printf("[NVS] Saved: NAG=%d China=%d Chime=%d Sleep=%u SSID=\"%s\" HIDDEN=%d\n",
+    g_prefs.putUChar("hwov",  (uint8_t)state->hw_override);
+    g_prefs.putBool("otaig",  state->ota_ignore);
+    // can_trace deliberately not persisted (see prefs_load)
+
+    Serial.printf("[NVS] Saved: NAG=%d China=%d Chime=%d Sleep=%u SSID=\"%s\" HIDDEN=%d HWov=%d\n",
                   state->nag_killer, state->china_mode, state->suppress_speed_chime,
-                  state->sleep_idle_ms, state->wifi_ssid, state->wifi_hidden);
+                  state->sleep_idle_ms, state->wifi_ssid, state->wifi_hidden,
+                  (int)state->hw_override);
     g_prefs.end();
 }
