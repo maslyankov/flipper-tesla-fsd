@@ -51,6 +51,9 @@ void fsd_state_init(FSDState *state, TeslaHWVersion hw) {
     state->nag_killer           = true;
     state->suppress_speed_chime = true;
     state->emergency_vehicle_detect = false;
+    state->tsllc_stops          = false;
+    state->continue_on_green    = false;
+    state->disable_telemetry    = false;
     state->force_fsd            = false;
     state->china_mode           = false;
     state->bms_output           = false;
@@ -185,6 +188,13 @@ bool fsd_handle_autopilot_frame(FSDState *state, CanFrame *frame) {
             // Activate FSD: set bit 46
             set_bit(frame, 46, true);
 
+            // TSLLC + continue-on-green (per ev-open-can-tools HW3 plugin).
+            // Both ride on the FSD-active frame: TSLLC stops at red, then
+            // continue-on-green resumes through green when a lead car
+            // crosses the intersection ahead of us.
+            if (state->tsllc_stops)       set_bit(frame, 38, true);
+            if (state->continue_on_green) set_bit(frame, 39, true);
+
             // Write speed profile into bits 2:1 of byte 6
             frame->data[6] &= ~0x06u;
             frame->data[6] |= (uint8_t)((state->speed_profile & 0x03) << 1);
@@ -194,6 +204,12 @@ bool fsd_handle_autopilot_frame(FSDState *state, CanFrame *frame) {
             // Nag suppression via bit 19 (clear = no hands-on-wheel request)
             set_bit(frame, 19, false);
             state->nag_suppressed = true;
+            // Telemetry: clear UI_enableCabinCameraTelemetry (bit 48) and
+            // UI_autopilotTelemetryInChina (bit 50). Same plane as HW4.
+            if (state->disable_telemetry) {
+                set_bit(frame, 48, false);
+                set_bit(frame, 50, false);
+            }
             modified = true;
         }
         if (mux == 2 && state->fsd_enabled) {
@@ -211,12 +227,23 @@ bool fsd_handle_autopilot_frame(FSDState *state, CanFrame *frame) {
             set_bit(frame, 60, true);   // HW4 additional FSD bit
             if (state->emergency_vehicle_detect)
                 set_bit(frame, 59, true);  // emergency vehicle detection
+            // TSLLC stops + continue-on-green (per ev-open-can-tools).
+            // Same bits as HW3 — both bits live on the UI→DAS plane and
+            // are HW-agnostic on the mux-0 layout.
+            if (state->tsllc_stops)       set_bit(frame, 38, true);
+            if (state->continue_on_green) set_bit(frame, 39, true);
             modified = true;
         }
         if (mux == 1) {
             set_bit(frame, 19, false);  // clear hands-on-wheel nag
             set_bit(frame, 47, true);   // HW4 nag-suppression confirmation bit
             state->nag_suppressed = true;
+            // Telemetry: clear UI_enableCabinCameraTelemetry (bit 48) and
+            // UI_autopilotTelemetryInChina (bit 50). Same plane as HW3.
+            if (state->disable_telemetry) {
+                set_bit(frame, 48, false);
+                set_bit(frame, 50, false);
+            }
             modified = true;
         }
         if (mux == 2) {
@@ -603,4 +630,62 @@ void fsd_handle_dc_bus(FSDState *state, const CanFrame *frame) {
     state->pack_voltage_v   = (float)hv_raw * 0.1f;
     state->lv_bus_seen      = true;
     state->bms_seen         = true;
+}
+
+// ── Telemetry / logging disable (port of ev-open-can-tools plugin) ──────────
+// Bits derived from upstream Beta/disable-telemetry.json. Upstream warns it
+// is UNTESTED. Each handler clones-modify-send; the dispatcher in main.cpp
+// gates them on state.disable_telemetry.
+
+// Tesla CRC: sum of byte 0..6 plus the low and high bytes of the CAN ID,
+// written into byte 7. Same algorithm used by 0x399 chime suppress and the
+// 0x370 nag echo. Caller is responsible for having mutated byte 0..6 first.
+static uint8_t tesla_crc(const CanFrame *frame, uint32_t id) {
+    uint8_t sum = 0;
+    for (int i = 0; i < 7; i++) sum += frame->data[i];
+    sum += (uint8_t)(id & 0xFFu) + (uint8_t)((id >> 8) & 0xFFu);
+    return sum;
+}
+
+bool fsd_handle_telemetry_3f8(CanFrame *frame) {
+    if (frame->dlc < 8) return false;
+    // UI_driverAssistControl: 5 telemetry-enable flags scattered across
+    // byte 2 bit 3 (19), byte 5 bits 2/3/4 (42/43/44), byte 6 bit 7 (55).
+    set_bit(frame, 19, false);  // UI_enableClipParkedTelemetry
+    set_bit(frame, 42, false);  // UI_enableClipTelemetry
+    set_bit(frame, 43, false);  // UI_enableTripTelemetry
+    set_bit(frame, 44, false);  // UI_enableRoadSegmentTelemetry
+    set_bit(frame, 55, false);  // UI_enableClipStartStopTelemetry
+    return true;
+}
+
+bool fsd_handle_telemetry_389(CanFrame *frame) {
+    if (frame->dlc < 8) return false;
+    // DAS_status2: bit 13 (byte 1 bit 5) = DAS_pmmLoggingRequest;
+    //              bit 34 (byte 4 bit 2), bit 35 (byte 4 bit 3) = DAS_radarTelemetry
+    set_bit(frame, 13, false);
+    set_bit(frame, 34, false);
+    set_bit(frame, 35, false);
+    // Tesla CRC byte 7 — frame has a counter on byte 6 high nibble that we
+    // leave at whatever the car sent. The receiver sees one car-counter / one
+    // ours-counter for the same value; bits propagate either way.
+    frame->data[7] = tesla_crc(frame, CAN_ID_DAS_STATUS2);
+    return true;
+}
+
+bool fsd_handle_telemetry_3b3(CanFrame *frame) {
+    if (frame->dlc < 4) return false;
+    // UI_vehicleControl2 bit 31 (byte 3 bit 7) = UI_conditionalLoggingEnabledVCSEC
+    set_bit(frame, 31, false);
+    return true;
+}
+
+bool fsd_handle_telemetry_alertmatrix(CanFrame *frame) {
+    if (frame->dlc < 5) return false;
+    // alertMatrix frames are mux'd by byte 0 low nibble (mask 0x0F). Only
+    // mux 0 carries a030_ECULogUploadRequest at bit 33 (byte 4 bit 1).
+    // For other muxes the bit lives elsewhere or doesn't exist — skip.
+    if ((frame->data[0] & 0x0Fu) != 0) return false;
+    set_bit(frame, 33, false);
+    return true;
 }

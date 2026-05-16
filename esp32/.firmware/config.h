@@ -35,6 +35,25 @@
 #define CAN_ID_DI_TORQUE      0x108u  // 264  - DI_torque: drive motor torque
 #define CAN_ID_STEER_ANGLE    0x129u  // 297  - SCCM_steeringAngleSensor
 
+// ── Telemetry-disable target frames (port of ev-open-can-tools plugin) ───────
+// All of these get telemetry/logging bits cleared when state.disable_telemetry
+// is on. Most live on Chassis or Vehicle CAN, so users tapped only into
+// Party CAN will see partial coverage — frames not visible on the tapped bus
+// can't be modified.
+#define CAN_ID_DAS_STATUS2    0x389u  //  905 - DAS_status2: PMM logging + radar telemetry
+#define CAN_ID_UI_VEH_CTRL2   0x3B3u  //  947 - UI_vehicleControl2: VCSEC conditional logging
+// alertMatrix family — all share mux 0, bit 33 = a030_ECULogUploadRequest
+#define CAN_ID_ALERT_VCFRONT  0x340u  //  832 - VCFRONT_alertMatrix
+#define CAN_ID_ALERT_VCFRONT1 0x341u  //  833 - VCFRONT1_alertMatrix
+#define CAN_ID_ALERT_VCFRONT2 0x342u  //  834 - VCFRONT2_alertMatrix
+#define CAN_ID_ALERT_VCLEFT   0x360u  //  864 - VCLEFT_alertMatrix
+#define CAN_ID_ALERT_USM      0x3BAu  //  954 - USM_alertMatrix
+#define CAN_ID_ALERT_VCRIGHT  0x3C0u  //  960 - VCRIGHT_alertMatrix
+#define CAN_ID_ALERT_EPBL     0x3C8u  //  968 - EPBL_alertMatrix
+#define CAN_ID_ALERT_VCBATT0  0x3CDu  //  973 - VCBATT0_alertMatrix
+#define CAN_ID_ALERT_VCBATT1  0x3CEu  //  974 - VCBATT1_alertMatrix
+#define CAN_ID_ALERT_VCBATT2  0x3CFu  //  975 - VCBATT2_alertMatrix
+
 // ── GPIO ──────────────────────────────────────────────────────────────────────
 #if defined(BOARD_LILYGO)
   #define PIN_CAN_TX         27

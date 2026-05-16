@@ -50,6 +50,22 @@ struct FSDState {
     bool           suppress_speed_chime;    // ISA chime suppress (HW4, 0x399)
     bool           china_mode;              // bypass FSD UI selection check for China vehicles
     bool           emergency_vehicle_detect;// set bit59 in mux0 (HW4)
+    // 0x3FD mux 0 bit 38 — UI_fsdStopsControlEnabled (TSLLC: traffic light
+    // stop sign control). Per ev-open-can-tools plugins, paired with the
+    // FSD-activation bit (46) it enables the car's TSLLC behaviour. Off by
+    // default; gated on fsd_enabled in the handler so it never asserts
+    // without FSD itself being engaged. Applies to HW3 + HW4.
+    bool           tsllc_stops;
+    // 0x3FD mux 0 bit 39 — UI_fsdContinueOnGreenWithCIPV (continue through
+    // a green light when a Closest-In-Path Vehicle is in front instead of
+    // stopping). HW3 + HW4. Same fsd_enabled gating.
+    bool           continue_on_green;
+    // Master switch for the disable-telemetry port (ev-open-can-tools
+    // Beta/disable-telemetry.json). When on, the handler clears telemetry /
+    // logging / ECU-log-upload-request bits across 14 CAN IDs. Upstream
+    // marks this as UNTESTED — the cleared bits are derived from the Tesla
+    // DBC but the in-car effect isn't confirmed. Off by default.
+    bool           disable_telemetry;
     bool           nag_killer;              // 0x370 counter+1 echo
     uint32_t       nag_echo_count;
 
@@ -224,6 +240,29 @@ void fsd_build_precondition_frame(CanFrame *frame);
  *  Overwrites byte[0] lower 6 bits to 0x1B (SELF_DRIVING).
  *  Returns true if frame was modified and should be re-sent. */
 bool fsd_handle_tlssc_restore(FSDState *state, CanFrame *frame);
+
+// ── Telemetry / logging disable (port of ev-open-can-tools plugin) ──────────
+// Each handler clears a specific set of bits per the upstream DBC. All return
+// true if the frame was modified and should be re-sent. The dispatcher in
+// main.cpp only invokes them when state.disable_telemetry is on. The 0x3FD
+// mux-1 telemetry bits (48, 50) are handled inline in fsd_handle_autopilot_frame.
+
+/** 0x3F8 (UI_driverAssistControl) — clear UI_enableClip / Trip /
+ *  RoadSegment / ClipParked / ClipStartStop telemetry. Bits 19, 42, 43, 44, 55. */
+bool fsd_handle_telemetry_3f8(CanFrame *frame);
+
+/** 0x389 (DAS_status2) — clear DAS_pmmLoggingRequest (bit 13) and
+ *  DAS_radarTelemetry (bits 34, 35). Recomputes Tesla CRC into byte 7. */
+bool fsd_handle_telemetry_389(CanFrame *frame);
+
+/** 0x3B3 (UI_vehicleControl2) — clear UI_conditionalLoggingEnabledVCSEC (bit 31). */
+bool fsd_handle_telemetry_3b3(CanFrame *frame);
+
+/** Generic *_alertMatrix mux-0 handler — clears a030_ECULogUploadRequest
+ *  (bit 33) on any of the ten alertMatrix IDs (0x340, 0x341, 0x342, 0x360,
+ *  0x3BA, 0x3C0, 0x3C8, 0x3CD, 0x3CE, 0x3CF). Returns false if the frame
+ *  isn't on mux 0 (no modification needed for other muxes). */
+bool fsd_handle_telemetry_alertmatrix(CanFrame *frame);
 
 /** Parse DAS_status (0x39B) — updates das_hands_on_state plus lane change,
  *  side-collision warn/avoid, FCW and vision speed limit fields. */

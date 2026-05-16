@@ -454,12 +454,48 @@ static void process_frame(const CanFrame &frame) {
         return;
     }
 
-    // Follow distance → speed_profile (0x3F8), no TX
+    // Follow distance → speed_profile (0x3F8). Read-only by default; when
+    // disable_telemetry is on, also clones-modify-send to clear the five
+    // UI_enable*Telemetry bits.
     if (frame.id == CAN_ID_FOLLOW_DIST) {
         state_enter();
         fsd_handle_follow_distance(&g_state, &frame);
         state_exit();
+        if (s.disable_telemetry && tx) {
+            CanFrame f = frame;
+            if (fsd_handle_telemetry_3f8(&f)) g_can[frame.bus]->send(f);
+        }
         return;
+    }
+
+    // Telemetry / logging disable — fan-out dispatcher for the remaining
+    // 12 frames from the ev-open-can-tools port. The 0x3FD mux-1 telemetry
+    // bits are handled inline in fsd_handle_autopilot_frame.
+    if (s.disable_telemetry && tx) {
+        bool handled = false;
+        CanFrame f = frame;
+        switch (frame.id) {
+            case CAN_ID_DAS_STATUS2:
+                handled = fsd_handle_telemetry_389(&f); break;
+            case CAN_ID_UI_VEH_CTRL2:
+                handled = fsd_handle_telemetry_3b3(&f); break;
+            case CAN_ID_ALERT_VCFRONT:
+            case CAN_ID_ALERT_VCFRONT1:
+            case CAN_ID_ALERT_VCFRONT2:
+            case CAN_ID_ALERT_VCLEFT:
+            case CAN_ID_ALERT_USM:
+            case CAN_ID_ALERT_VCRIGHT:
+            case CAN_ID_ALERT_EPBL:
+            case CAN_ID_ALERT_VCBATT0:
+            case CAN_ID_ALERT_VCBATT1:
+            case CAN_ID_ALERT_VCBATT2:
+                handled = fsd_handle_telemetry_alertmatrix(&f); break;
+            default: break;
+        }
+        if (handled) {
+            g_can[frame.bus]->send(f);
+            return;
+        }
     }
 
     // TLSSC Restore (0x331) — DAS config spoof + DAS_autopilot tier readback

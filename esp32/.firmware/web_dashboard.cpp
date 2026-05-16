@@ -414,6 +414,18 @@ input:checked+.sl2:before{transform:translateX(20px);background:#fff}
     <label class="sw"><input type="checkbox" id="swTlssc" onchange="cmd('tlssc_restore',this.checked)"><span class="sl2"></span></label>
   </div>
   <div class="row">
+    <span class="lbl">[B] TSLLC stops control</span>
+    <label class="sw"><input type="checkbox" id="swTsllc" onchange="cmd('tsllc_stops',this.checked)"><span class="sl2"></span></label>
+  </div>
+  <div class="row">
+    <span class="lbl">[B] Continue on green w/ CIPV</span>
+    <label class="sw"><input type="checkbox" id="swCogCipv" onchange="cmd('continue_on_green',this.checked)"><span class="sl2"></span></label>
+  </div>
+  <div class="row">
+    <span class="lbl">[B] Disable telemetry (UNTESTED)</span>
+    <label class="sw"><input type="checkbox" id="swNoTelem" onchange="cmd('disable_telemetry',this.checked)"><span class="sl2"></span></label>
+  </div>
+  <div class="row">
     <span class="lbl">CAN Dump</span>
     <label class="sw"><input type="checkbox" id="swDump" onchange="cmd('dump',this.checked)"><span class="sl2"></span></label>
   </div>
@@ -591,6 +603,9 @@ function upd(d){
   if(document.getElementById('swChina')) document.getElementById('swChina').checked=d.china_mode;
   if(document.getElementById('swChime')) document.getElementById('swChime').checked=d.suppress_speed_chime;
   if(document.getElementById('swTlssc')) document.getElementById('swTlssc').checked=d.tlssc_restore;
+  if(document.getElementById('swTsllc')) document.getElementById('swTsllc').checked=d.tsllc_stops;
+  if(document.getElementById('swCogCipv')) document.getElementById('swCogCipv').checked=d.continue_on_green;
+  if(document.getElementById('swNoTelem')) document.getElementById('swNoTelem').checked=d.disable_telemetry;
   if(document.getElementById('swDump')) document.getElementById('swDump').checked=!!d.can_dump;
   
   if(document.activeElement.id!=='numSleep' && document.getElementById('numSleep'))
@@ -984,6 +999,9 @@ static String build_json() {
     j += "\"china_mode\":";    j += state.china_mode                   ? "true" : "false"; j += ',';
     j += "\"suppress_speed_chime\":"; j += state.suppress_speed_chime  ? "true" : "false"; j += ',';
     j += "\"tlssc_restore\":"; j += state.tlssc_restore                ? "true" : "false"; j += ',';
+    j += "\"tsllc_stops\":";   j += state.tsllc_stops                  ? "true" : "false"; j += ',';
+    j += "\"continue_on_green\":"; j += state.continue_on_green        ? "true" : "false"; j += ',';
+    j += "\"disable_telemetry\":"; j += state.disable_telemetry        ? "true" : "false"; j += ',';
     j += "\"can_vehicle_detected\":"; j += can_vehicle_detected       ? "true" : "false"; j += ',';
     j += "\"bms_hv_seen\":";   j += state.seen_bms_hv;                 j += ',';
     j += "\"bms_soc_seen\":";  j += state.seen_bms_soc;                j += ',';
@@ -1087,6 +1105,42 @@ static void ws_event(uint8_t num, WStype_t type,
             saved = *g_state;
             state_exit();
             Serial.printf("[Web] TLSSC Restore: %s\n", enabled ? "ON" : "OFF");
+            prefs_save(&saved);
+        }
+    } else if (strstr(buf, "\"tsllc_stops\"")) {
+        if (vptr) {
+            while (*vptr == ' ' || *vptr == ':') vptr++;
+            bool enabled = (strncmp(vptr, "true", 4) == 0);
+            FSDState saved;
+            state_enter();
+            g_state->tsllc_stops = enabled;
+            saved = *g_state;
+            state_exit();
+            Serial.printf("[Web] TSLLC stops: %s\n", enabled ? "ON" : "OFF");
+            prefs_save(&saved);
+        }
+    } else if (strstr(buf, "\"continue_on_green\"")) {
+        if (vptr) {
+            while (*vptr == ' ' || *vptr == ':') vptr++;
+            bool enabled = (strncmp(vptr, "true", 4) == 0);
+            FSDState saved;
+            state_enter();
+            g_state->continue_on_green = enabled;
+            saved = *g_state;
+            state_exit();
+            Serial.printf("[Web] Continue-on-green: %s\n", enabled ? "ON" : "OFF");
+            prefs_save(&saved);
+        }
+    } else if (strstr(buf, "\"disable_telemetry\"")) {
+        if (vptr) {
+            while (*vptr == ' ' || *vptr == ':') vptr++;
+            bool enabled = (strncmp(vptr, "true", 4) == 0);
+            FSDState saved;
+            state_enter();
+            g_state->disable_telemetry = enabled;
+            saved = *g_state;
+            state_exit();
+            Serial.printf("[Web] Disable telemetry: %s\n", enabled ? "ON" : "OFF");
             prefs_save(&saved);
         }
     } else if (strstr(buf, "\"force_fsd\"")) {
