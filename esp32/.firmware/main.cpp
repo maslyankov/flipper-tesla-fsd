@@ -28,10 +28,33 @@
 #include "can_dump.h"
 #include "prefs.h"
 
+// ── Loop task stack ───────────────────────────────────────────────────────────
+// Override the Arduino-ESP32 default (8 KB) on the T-2CAN env. The dual-bus
+// build pulls in WebSockets broadcast paths that recurse through newlib's
+// dtoa() during JSON formatting (snprintf %.1f for the BMS / fps fields),
+// stacked on top of a ~1.2 KB FSDState copy and the ESP32-S3 USB-CDC ISR
+// frames. Empirically 8 KB trips the stack canary inside heap_caps_malloc on
+// the first ws_broadcast — 16 KB leaves comfortable headroom.
+#if defined(BOARD_LILYGO_T2CAN)
+SET_LOOP_TASK_STACK_SIZE(16 * 1024);
+#endif
+
 // ── Globals ───────────────────────────────────────────────────────────────────
-static CanDriver *g_can   = nullptr;
-static FSDState   g_state = {};
-static portMUX_TYPE g_state_mux = portMUX_INITIALIZER_UNLOCKED;
+// g_can[] holds one driver per CAN bus. Single-bus envs use g_can[0] only;
+// dual-bus envs (T-2CAN) populate both slots. Frames carry their source bus
+// in CanFrame::bus; echo/modify TX targets the source bus, and self-initiated
+// TX (precondition inject, BMS query) goes to g_can[0] by default.
+static CanDriver *g_can[CAN_BUS_COUNT] = {};
+static FSDState   g_state              = {};
+static portMUX_TYPE g_state_mux        = portMUX_INITIALIZER_UNLOCKED;
+
+// Toggle listen-only on every active bus — the dashboard's TX-arm switch and
+// the runtime mode change in dispatch_clicks() both need this.
+static void can_set_listen_only_all(bool listen_only) {
+    for (uint8_t i = 0; i < CAN_BUS_COUNT; i++) {
+        if (g_can[i]) g_can[i]->setListenOnly(listen_only);
+    }
+}
 
 static void state_enter() {
     portENTER_CRITICAL(&g_state_mux);
@@ -85,7 +108,7 @@ static bool     g_factory_reset_window   = false;  // set true on clean boot, cl
 static bool     g_factory_reset_eligible = false;  // latched at leading edge if press was in window
 static bool     g_factory_reset_armed    = false;  // blink done, waiting for release
 
-#if defined(SLEEP_STRATEGY_EXT0) || defined(SLEEP_STRATEGY_TIMER)
+#if defined(SLEEP_STRATEGY_EXT0) || defined(SLEEP_STRATEGY_TIMER) || defined(SLEEP_STRATEGY_EXT1)
 static uint32_t g_last_can_rx_ms = 0;
 static bool     g_sleep_warned   = false;
 #endif
@@ -102,7 +125,7 @@ static void start_wifi_lazy() {
     if (g_wifi_started) return;
     g_wifi_started = true;
     if (wifi_ap_init(&g_state)) {
-        web_dashboard_init(&g_state, g_can, &g_state_mux);
+        web_dashboard_init(&g_state, g_can, CAN_BUS_COUNT, &g_state_mux);
     }
 }
 #endif
@@ -121,7 +144,7 @@ static void dispatch_clicks(int n) {
         }
         saved = g_state;
         state_exit();
-        g_can->setListenOnly(!active);
+        can_set_listen_only_all(!active);
         Serial.println(active ? "[BTN] → Active mode" : "[BTN] → Listen-Only mode");
         can_dump_log(active ? "MODE switched to Active — TX enabled" : "MODE switched to Listen-Only — TX disabled");
         prefs_save(&saved);
@@ -242,6 +265,7 @@ static void update_led() {
 static void process_frame(const CanFrame &frame) {
     state_enter();
     g_state.rx_count++;
+    if (frame.bus < CAN_BUS_COUNT) g_state.rx_count_bus[frame.bus]++;
     if (frame.id == CAN_ID_GTW_CAR_STATE)  g_state.seen_gtw_car_state++;
     if (frame.id == CAN_ID_GTW_CAR_CONFIG) g_state.seen_gtw_car_config++;
     if (frame.id == CAN_ID_AP_CONTROL)     g_state.seen_ap_control++;
@@ -285,7 +309,7 @@ static void process_frame(const CanFrame &frame) {
     state_exit();
 
     can_dump_record(frame);
-#if defined(SLEEP_STRATEGY_EXT0) || defined(SLEEP_STRATEGY_TIMER)
+#if defined(SLEEP_STRATEGY_EXT0) || defined(SLEEP_STRATEGY_TIMER) || defined(SLEEP_STRATEGY_EXT1)
     g_last_can_rx_ms = millis();
     g_sleep_warned   = false;
   #if defined(SLEEP_STRATEGY_TIMER)
@@ -373,7 +397,7 @@ static void process_frame(const CanFrame &frame) {
             uint8_t cnt_out = echo.data[6] & 0x0F;
             can_dump_log("NAG 0x370 hands_off lvl=%u cnt=%u->%u %s",
                          lvl, cnt_in, cnt_out, tx ? "TX echo" : "listen-only no-TX");
-            if (tx) g_can->send(echo);
+            if (tx) g_can[frame.bus]->send(echo);
         }
         return;
     }
@@ -392,7 +416,7 @@ static void process_frame(const CanFrame &frame) {
         state_enter();
         bool modified = fsd_handle_legacy_autopilot(&g_state, &f);
         state_exit();
-        if (modified && tx) g_can->send(f);
+        if (modified && tx) g_can[frame.bus]->send(f);
         return;
     }
 
@@ -426,7 +450,7 @@ static void process_frame(const CanFrame &frame) {
         s.suppress_speed_chime) {
         CanFrame f = frame;
         if (fsd_handle_isa_speed_chime(&f) && tx)
-            g_can->send(f);
+            g_can[frame.bus]->send(f);
         return;
     }
 
@@ -448,7 +472,7 @@ static void process_frame(const CanFrame &frame) {
         state_enter();
         bool modified = fsd_handle_tlssc_restore(&g_state, &f);
         state_exit();
-        if (modified && tx) g_can->send(f);
+        if (modified && tx) g_can[frame.bus]->send(f);
         return;
     }
 
@@ -458,7 +482,7 @@ static void process_frame(const CanFrame &frame) {
         state_enter();
         bool modified = fsd_handle_autopilot_frame(&g_state, &f);
         state_exit();
-        if (modified && tx) g_can->send(f);
+        if (modified && tx) g_can[frame.bus]->send(f);
         return;
     }
 }
@@ -477,6 +501,55 @@ static void sleep_tick(uint32_t now) {
         sd_syslog_close();
         led_set(LED_SLEEP);
         esp_sleep_enable_ext0_wakeup((gpio_num_t)PIN_CAN_RX, 0);
+        esp_deep_sleep_start();
+        // never returns
+    } else if (!g_sleep_warned && idle_ms >= (s.sleep_idle_ms - SLEEP_WARN_MS)) {
+        g_sleep_warned = true;
+        uint32_t remaining_ms = s.sleep_idle_ms - idle_ms;
+        Serial.printf("[SLEEP] Warning: %lu ms idle, sleeping in %lu ms\n",
+                      (unsigned long)idle_ms, (unsigned long)remaining_ms);
+    }
+}
+#elif defined(SLEEP_STRATEGY_EXT1)
+// ── Deep-sleep watchdog (EXT1 multi-pin wake, ESP32-S3) ──────────────────────
+// Wakes on any LOW edge across the mask: TWAI RX (PIN_CAN_RX) — bus B's
+// receive line idles HIGH and pulls LOW on a dominant bit — or MCP2515 INT
+// (PIN_MCP_INT) — bus A's chip pulls INT LOW when CANINTE bits are
+// asserted. With CANINTE.RX0IE/RX1IE enabled at boot the MCP2515 fires INT
+// on every received frame, so bus traffic on either side ends sleep with
+// zero polling overhead.
+static void sleep_tick(uint32_t now) {
+    if (now < g_last_can_rx_ms) return;
+    uint32_t idle_ms = now - g_last_can_rx_ms;
+    FSDState s = state_snapshot();
+
+    if (idle_ms >= s.sleep_idle_ms) {
+        const uint64_t wake_mask =
+            (1ULL << PIN_CAN_RX) |
+            (1ULL << PIN_MCP_INT);
+        Serial.printf("[SLEEP] Entering deep sleep (EXT1 wake on GPIO %d|%d) after %lu ms CAN silence\n",
+                      PIN_CAN_RX, PIN_MCP_INT, (unsigned long)idle_ms);
+        can_dump_stop();
+        sd_syslog_close();
+        led_set(LED_SLEEP);
+        // Configure both wake pins as RTC inputs with internal pullups so they
+        // don't float during deep sleep. The TWAI RX line is held HIGH by the
+        // transceiver during recessive bus state, but the MCP2515 INT is
+        // open-drain — without a pullup it would float LOW and falsely wake
+        // the chip immediately. Keep the RTC peripheral domain powered so the
+        // pullups survive the sleep transition.
+        rtc_gpio_init((gpio_num_t)PIN_CAN_RX);
+        rtc_gpio_set_direction((gpio_num_t)PIN_CAN_RX, RTC_GPIO_MODE_INPUT_ONLY);
+        rtc_gpio_pullup_en((gpio_num_t)PIN_CAN_RX);
+        rtc_gpio_pulldown_dis((gpio_num_t)PIN_CAN_RX);
+        rtc_gpio_init((gpio_num_t)PIN_MCP_INT);
+        rtc_gpio_set_direction((gpio_num_t)PIN_MCP_INT, RTC_GPIO_MODE_INPUT_ONLY);
+        rtc_gpio_pullup_en((gpio_num_t)PIN_MCP_INT);
+        rtc_gpio_pulldown_dis((gpio_num_t)PIN_MCP_INT);
+        esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
+        // Wake the moment either bus produces a dominant bit / interrupt
+        // assertion. ANY_LOW is supported on ESP32-S3 with IDF ≥ 5.0.
+        esp_sleep_enable_ext1_wakeup(wake_mask, ESP_EXT1_WAKEUP_ANY_LOW);
         esp_deep_sleep_start();
         // never returns
     } else if (!g_sleep_warned && idle_ms >= (s.sleep_idle_ms - SLEEP_WARN_MS)) {
@@ -525,7 +598,7 @@ static void sleep_tick(uint32_t now) {
 
 // ── setup ─────────────────────────────────────────────────────────────────────
 void setup() {
-#if defined(SLEEP_STRATEGY_EXT0) || defined(SLEEP_STRATEGY_TIMER)
+#if defined(SLEEP_STRATEGY_EXT0) || defined(SLEEP_STRATEGY_TIMER) || defined(SLEEP_STRATEGY_EXT1)
     g_last_can_rx_ms = millis();
 #endif
 #if defined(SLEEP_STRATEGY_TIMER)
@@ -533,6 +606,13 @@ void setup() {
     // subsystem; release it before pinMode() below so digital IO regains
     // control. Safe no-op when the pin was never in RTC mode (cold boot).
     rtc_gpio_deinit((gpio_num_t)PIN_BUTTON);
+#endif
+#if defined(SLEEP_STRATEGY_EXT1)
+    // Release the wake pins from the RTC IO subsystem so the TWAI driver and
+    // future MCP INT polling can claim them as regular GPIOs. Safe no-op on
+    // cold boot when neither was ever in RTC mode.
+    rtc_gpio_deinit((gpio_num_t)PIN_CAN_RX);
+    rtc_gpio_deinit((gpio_num_t)PIN_MCP_INT);
 #endif
     Serial.begin(115200);
     delay(300);
@@ -584,6 +664,19 @@ void setup() {
     // which causes the TWAI controller to go bus-off the first time it tries to TX.
     pinMode(PIN_CAN_SPEED_MODE, OUTPUT);
     digitalWrite(PIN_CAN_SPEED_MODE, LOW);
+#endif
+
+#if defined(BOARD_LILYGO_T2CAN)
+    // MCP2515 RST is active-low; pulse it LOW briefly then HIGH so the chip
+    // starts from a known reset state before the SPI driver's reset() command
+    // runs. Wake-from-deep-sleep also lands here because RTC IO release in
+    // sleep_tick leaves the pin in input-with-pullup; driving it as a GPIO
+    // output regains control.
+    pinMode(PIN_MCP_RST, OUTPUT);
+    digitalWrite(PIN_MCP_RST, LOW);
+    delay(5);
+    digitalWrite(PIN_MCP_RST, HIGH);
+    delay(10);
 #endif
 
     Serial.printf("[CFG] pins: LED=%d BUTTON=%d CAN_TX=%d CAN_RX=%d\n",
@@ -650,6 +743,23 @@ void setup() {
         }
         g_last_can_rx_ms = millis();
     }
+#elif defined(SLEEP_STRATEGY_EXT1)
+    {
+        esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+        if (cause == ESP_SLEEP_WAKEUP_EXT1) {
+            // Bit-mask of the GPIOs that pulled LOW — at least one of
+            // {PIN_CAN_RX, PIN_MCP_INT}. Logged so the user can tell which
+            // bus woke the device.
+            uint64_t status = esp_sleep_get_ext1_wakeup_status();
+            const char *src = "unknown";
+            if (status & (1ULL << PIN_MCP_INT))   src = "MCP2515 INT (bus 0)";
+            else if (status & (1ULL << PIN_CAN_RX)) src = "TWAI RX (bus 1)";
+            Serial.printf("[WAKE] Woken by CAN activity — %s\n", src);
+        } else if (cause != ESP_SLEEP_WAKEUP_UNDEFINED) {
+            Serial.printf("[WAKE] Wakeup cause=%d\n", (int)cause);
+        }
+        g_last_can_rx_ms = millis();
+    }
 #elif defined(SLEEP_STRATEGY_TIMER)
     {
         esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
@@ -669,23 +779,53 @@ void setup() {
     }
 #endif
 
-    g_can = can_driver_create();
-    if (!g_can->begin(true)) {
-        Serial.println("[ERR] CAN driver init FAILED — check wiring");
-        led_set(LED_RED);
-        // Halt: signal error via blinking red indefinitely
-        while (true) {
-            led_set(LED_RED);   delay(200);
-            led_set(LED_OFF);   delay(200);
+#if defined(CAN_DRIVER_DUAL)
+    // Dual-bus build (T-2CAN V1.0): MCP2515 over SPI + ESP32-S3 TWAI.
+    // Bus 0 = MCP2515 ("Can A") — has a dedicated INT line for low-power
+    //         wake-on-CAN. Recommended target for the BMS / Chassis tap.
+    // Bus 1 = TWAI ("Can B") — uses an external transceiver on PIN_CAN_RX
+    //         and PIN_CAN_TX.
+    {
+        Mcp2515Pins mcp{
+            /*cs*/    PIN_MCP_CS,
+            /*sck*/   PIN_MCP_SCK,
+            /*mosi*/  PIN_MCP_MOSI,
+            /*miso*/  PIN_MCP_MISO,
+            /*int*/   PIN_MCP_INT,
+            /*MHz*/   8,           // T-2CAN V1.0 module has an 8 MHz crystal
+            /*label*/ "MCP2515",
+        };
+        TwaiPins twai{ PIN_CAN_TX, PIN_CAN_RX };
+        g_can[0] = can_driver_create_mcp2515(mcp);
+        g_can[1] = can_driver_create_twai(twai);
+    }
+#else
+    g_can[0] = can_driver_create();
+#endif
+
+    for (uint8_t i = 0; i < CAN_BUS_COUNT; i++) {
+        if (!g_can[i] || !g_can[i]->begin(true)) {
+            Serial.printf("[ERR] CAN bus %u (%s) init FAILED — check wiring\n",
+                          (unsigned)i, g_can[i] ? g_can[i]->name() : "null");
+            led_set(LED_RED);
+            // Halt: signal error via blinking red indefinitely
+            while (true) {
+                led_set(LED_RED);   delay(200);
+                led_set(LED_OFF);   delay(200);
+            }
         }
     }
 
     if (state_snapshot().op_mode == OpMode_Active) {
-        g_can->setListenOnly(false);
+        can_set_listen_only_all(false);
         Serial.println("[CAN] 500 kbps — Active (restored from NVS)");
     } else {
         Serial.println("[CAN] 500 kbps — Listen-Only");
     }
+#if defined(CAN_DRIVER_DUAL)
+    Serial.printf("[CAN] Bus 0: %s   Bus 1: %s\n",
+                  g_can[0]->name(), g_can[1]->name());
+#endif
     Serial.println("[BTN] Single click : toggle Listen-Only / Active");
     Serial.println("[BTN] Long press 3s: toggle NAG Killer");
     Serial.println("[BTN] Double click : toggle BMS serial output");
@@ -702,7 +842,7 @@ void setup() {
     }
 #else
     if (wifi_ap_init(&g_state)) {
-        web_dashboard_init(&g_state, g_can, &g_state_mux);
+        web_dashboard_init(&g_state, g_can, CAN_BUS_COUNT, &g_state_mux);
     }
 #endif
 }
@@ -718,29 +858,45 @@ void loop() {
 
     button_tick();
 
-    // Drain all available CAN frames in one shot
+    // Drain all available CAN frames from every bus in one shot. Each frame
+    // is tagged with its source bus before dispatch so the handler can echo
+    // TX back to the same bus.
     CanFrame frame;
-    while (g_can->receive(frame)) {
-        process_frame(frame);
+    for (uint8_t b = 0; b < CAN_BUS_COUNT; b++) {
+        if (!g_can[b]) continue;
+        while (g_can[b]->receive(frame)) {
+            frame.bus = b;
+            process_frame(frame);
+        }
     }
 
     // ── Periodic error counter refresh (~every 250 ms) ────────────────────────
     static uint32_t last_err_ms = 0;
     if ((now - last_err_ms) >= 250u) {
+        uint32_t per_bus[CAN_BUS_COUNT] = {};
+        uint32_t total = 0;
+        for (uint8_t i = 0; i < CAN_BUS_COUNT; i++) {
+            if (g_can[i]) per_bus[i] = g_can[i]->errorCount();
+            total += per_bus[i];
+        }
         state_enter();
-        g_state.crc_err_count = g_can->errorCount();
+        g_state.crc_err_count = total;
+        for (uint8_t i = 0; i < CAN_BUS_COUNT; i++) g_state.err_count_bus[i] = per_bus[i];
         state_exit();
         last_err_ms = now;
     }
 
     // ── Precondition frame injection ──────────────────────────────────────────
+    // Self-initiated TX goes to bus 0 by default. On dual-bus T-2CAN that's
+    // the MCP2515 (typically wired to the bus carrying 0x082 listeners).
     static uint32_t last_precond_ms = 0;
     FSDState s = state_snapshot();
     if (s.precondition && fsd_can_transmit(&s) &&
         (now - last_precond_ms) >= PRECOND_INTERVAL_MS) {
         CanFrame pf;
         fsd_build_precondition_frame(&pf);
-        g_can->send(pf);
+        pf.bus = 0;
+        g_can[0]->send(pf);
         last_precond_ms = now;
     }
 
@@ -800,7 +956,7 @@ void loop() {
 
     can_dump_tick(now);
 
-#if defined(SLEEP_STRATEGY_EXT0) || defined(SLEEP_STRATEGY_TIMER)
+#if defined(SLEEP_STRATEGY_EXT0) || defined(SLEEP_STRATEGY_TIMER) || defined(SLEEP_STRATEGY_EXT1)
     sleep_tick(now);
 #endif
 

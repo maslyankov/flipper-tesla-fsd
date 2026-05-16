@@ -9,6 +9,9 @@ struct CanFrame {
     uint32_t id;
     uint8_t  dlc;
     uint8_t  data[8];
+    uint8_t  bus;    // Source bus (0 = primary; 1 = secondary in dual-bus builds).
+                     // Drivers leave this untouched; the main loop tags frames
+                     // after receive() with which g_can[] index they came from.
 };
 
 // ── Hardware version ──────────────────────────────────────────────────────────
@@ -60,8 +63,14 @@ struct FSDState {
     uint8_t        ota_raw_state;           // raw GTW_updateInProgress bits [1:0]
     uint8_t        ota_assert_count;        // consecutive "in-progress" samples
     uint8_t        ota_clear_count;         // consecutive "not in-progress" samples
-    uint32_t       crc_err_count;           // CAN bus error counter
+    uint32_t       crc_err_count;           // CAN bus error counter (aggregate)
     uint32_t       rx_count;                // total frames seen (wiring check)
+    // Per-bus counters. rx_count_bus[i] counts frames received from g_can[i],
+    // err_count_bus[i] is the driver-reported bus-error count. Single-bus envs
+    // (CAN_BUS_COUNT=1) only use index 0; dual envs populate both so the
+    // dashboard can show which tap is alive.
+    uint32_t       rx_count_bus[CAN_BUS_COUNT];
+    uint32_t       err_count_bus[CAN_BUS_COUNT];
     uint32_t       seen_gtw_car_state;      // 0x318 seen count
     uint32_t       seen_gtw_car_config;     // 0x398 seen count
     uint32_t       seen_ap_control;         // 0x3FD seen count

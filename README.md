@@ -147,6 +147,7 @@ Full-featured ESP32 port with WiFi web dashboard, NVS settings persistence, deep
 | M5Stack ATOM Lite + ATOMIC CAN | ~$14 | `m5stack-atom` |
 | Lilygo T-CAN485 | ~$15 | `esp32-lilygo` |
 | Waveshare ESP32-S3-RS485-CAN | ~$18 | `waveshare-s3-can` |
+| **LILYGO T-2CAN V1.0** (dual-bus: MCP2515 + TWAI) | ~$24 | `t-2can-v1` |
 | Generic ESP32 + MCP2515 | ~$6 | `esp32-mcp2515` |
 
 See [`esp32/README.md`](https://github.com/hypery11/flipper-tesla-fsd/tree/main/esp32) for setup, and [`HARDWARE.md`](HARDWARE.md) for the full comparison + wiring diagrams + X179 pinouts.
@@ -184,7 +185,7 @@ ufbt
 ```bash
 git clone https://github.com/hypery11/flipper-tesla-fsd.git
 cd flipper-tesla-fsd/esp32
-pio run -e m5stack-atom    # or: esp32-lilygo, waveshare-s3-can, esp32-mcp2515
+pio run -e m5stack-atom    # or: esp32-lilygo, waveshare-s3-can, esp32-mcp2515, t-2can-v1
 ```
 
 ---

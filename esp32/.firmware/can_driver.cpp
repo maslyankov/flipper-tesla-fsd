@@ -1,11 +1,14 @@
 /*
  * can_driver.cpp
  *
- * CAN driver abstraction: compile-time selection between
- *   CAN_DRIVER_TWAI   — ESP32 built-in TWAI peripheral (M5Stack ATOM Lite + ATOMIC CAN Base)
- *   CAN_DRIVER_MCP2515 — SPI-attached MCP2515 (generic ESP32 boards)
+ * CAN driver implementations:
+ *   CAN_DRIVER_TWAI    — ESP32 built-in TWAI peripheral (singleton; one bus only)
+ *   CAN_DRIVER_MCP2515 — SPI-attached MCP2515. Multiple instances supported in
+ *                        principle, though each needs its own CS/INT lines.
+ *   CAN_DRIVER_DUAL    — Build both. Used by t-2can-v1 to drive TWAI + MCP2515
+ *                        simultaneously.
  *
- * Both drivers implement the CanDriver interface from can_driver.h.
+ * Each concrete driver implements the CanDriver interface from can_driver.h.
  */
 
 #include "can_driver.h"
@@ -13,19 +16,29 @@
 #include <Arduino.h>
 #include <string.h>
 
-// ── TWAI driver ───────────────────────────────────────────────────────────────
-#if defined(CAN_DRIVER_TWAI)
+#if defined(CAN_DRIVER_TWAI) || defined(CAN_DRIVER_DUAL)
+  #include "driver/twai.h"
+#endif
 
-#include "driver/twai.h"
+#if defined(CAN_DRIVER_MCP2515) || defined(CAN_DRIVER_DUAL)
+  #include <SPI.h>
+  #include <mcp2515.h>   // autowp/autowp-mcp2515
+#endif
+
+// ── TWAI driver ───────────────────────────────────────────────────────────────
+// The ESP32 TWAI peripheral is a singleton — only one TwaiDriver instance can
+// be active at a time across the whole binary.
+#if defined(CAN_DRIVER_TWAI) || defined(CAN_DRIVER_DUAL)
 
 class TwaiDriver : public CanDriver {
+    TwaiPins pins_;
     bool     listen_only_ = false;
     bool     installed_   = false;
 
     bool install_and_start(bool listen_only) {
         twai_general_config_t g = TWAI_GENERAL_CONFIG_DEFAULT(
-            (gpio_num_t)PIN_CAN_TX,
-            (gpio_num_t)PIN_CAN_RX,
+            (gpio_num_t)pins_.tx_pin,
+            (gpio_num_t)pins_.rx_pin,
             listen_only ? TWAI_MODE_LISTEN_ONLY : TWAI_MODE_NORMAL);
         // Queue depths: 10 RX, 5 TX — sufficient for polling loop
         g.rx_queue_len = 10;
@@ -52,6 +65,8 @@ class TwaiDriver : public CanDriver {
     }
 
 public:
+    explicit TwaiDriver(const TwaiPins &pins) : pins_(pins) {}
+
     bool begin(bool listen_only) override {
         return install_and_start(listen_only);
     }
@@ -88,32 +103,46 @@ public:
         stop_and_uninstall();
         install_and_start(enable);
     }
+
+    const char *name() const override { return "TWAI"; }
 };
 
-CanDriver *can_driver_create() {
-    return new TwaiDriver();
+CanDriver *can_driver_create_twai(const TwaiPins &pins) {
+    return new TwaiDriver(pins);
 }
 
-// ── MCP2515 driver ────────────────────────────────────────────────────────────
-#elif defined(CAN_DRIVER_MCP2515)
+#endif  // CAN_DRIVER_TWAI || CAN_DRIVER_DUAL
 
-#include <SPI.h>
-#include <mcp2515.h>   // autowp/autowp-mcp2515
+// ── MCP2515 driver ────────────────────────────────────────────────────────────
+#if defined(CAN_DRIVER_MCP2515) || defined(CAN_DRIVER_DUAL)
 
 class Mcp2515Driver : public CanDriver {
-    MCP2515  mcp_;
-    bool     listen_only_  = false;
-    uint32_t err_count_    = 0;
+    MCP2515     mcp_;
+    Mcp2515Pins pins_;
+    bool        listen_only_  = false;
+    uint32_t    err_count_    = 0;
 
 public:
-    Mcp2515Driver() : mcp_(PIN_MCP_CS) {}
+    explicit Mcp2515Driver(const Mcp2515Pins &pins)
+        : mcp_(pins.cs_pin), pins_(pins) {}
 
     bool begin(bool listen_only) override {
-        SPI.begin(PIN_MCP_SCK, PIN_MCP_MISO, PIN_MCP_MOSI, PIN_MCP_CS);
+        // SPI.begin() is idempotent across instances on the same bus; multiple
+        // MCP2515 chips can share SCK/MOSI/MISO with their own CS lines. The
+        // last begin() call wins for SPI pins — by convention all instances
+        // should pass the same bus pins.
+        SPI.begin(pins_.sck_pin, pins_.miso_pin, pins_.mosi_pin, pins_.cs_pin);
         SPI.setFrequency(8000000);
 
         mcp_.reset();
-        if (mcp_.setBitrate(CAN_500KBPS, MCP_CRYSTAL_MHZ) != MCP2515::ERROR_OK)
+        CAN_CLOCK crystal;
+        switch (pins_.crystal_mhz) {
+            case 8:  crystal = MCP_8MHZ;  break;
+            case 16: crystal = MCP_16MHZ; break;
+            case 20: crystal = MCP_20MHZ; break;
+            default: crystal = MCP_8MHZ;  break;  // safe fallback for common Chinese modules
+        }
+        if (mcp_.setBitrate(CAN_500KBPS, crystal) != MCP2515::ERROR_OK)
             return false;
 
         MCP2515::ERROR err = listen_only
@@ -157,12 +186,49 @@ public:
         else
             mcp_.setNormalMode();
     }
+
+    const char *name() const override {
+        return pins_.label ? pins_.label : "MCP2515";
+    }
 };
 
-CanDriver *can_driver_create() {
-    return new Mcp2515Driver();
+CanDriver *can_driver_create_mcp2515(const Mcp2515Pins &pins) {
+    return new Mcp2515Driver(pins);
 }
 
+#endif  // CAN_DRIVER_MCP2515 || CAN_DRIVER_DUAL
+
+// ── Default single-bus factory ────────────────────────────────────────────────
+// Single-bus envs continue to call can_driver_create() and get the driver
+// chosen at compile time, with pins drawn from config.h macros.
+#if defined(CAN_DRIVER_TWAI) && !defined(CAN_DRIVER_DUAL)
+
+CanDriver *can_driver_create() {
+    TwaiPins p{ PIN_CAN_TX, PIN_CAN_RX };
+    return can_driver_create_twai(p);
+}
+
+#elif defined(CAN_DRIVER_MCP2515) && !defined(CAN_DRIVER_DUAL)
+
+CanDriver *can_driver_create() {
+    Mcp2515Pins p{
+        /*cs*/    PIN_MCP_CS,
+        /*sck*/   PIN_MCP_SCK,
+        /*mosi*/  PIN_MCP_MOSI,
+        /*miso*/  PIN_MCP_MISO,
+        /*int*/   -1,
+        /*MHz*/   MCP_CRYSTAL_HZ_DEFAULT,
+        /*label*/ "MCP2515",
+    };
+    return can_driver_create_mcp2515(p);
+}
+
+#elif defined(CAN_DRIVER_DUAL)
+// Dual-bus envs don't use the default factory; main.cpp instantiates each
+// driver explicitly with its own pin config. Provide a stub so any stray
+// caller fails loudly at link time rather than producing nullptr surprises.
+CanDriver *can_driver_create() { return nullptr; }
+
 #else
-#error "Define CAN_DRIVER_TWAI or CAN_DRIVER_MCP2515 in platformio.ini build_flags"
+#error "Define CAN_DRIVER_TWAI, CAN_DRIVER_MCP2515, or CAN_DRIVER_DUAL in platformio.ini build_flags"
 #endif

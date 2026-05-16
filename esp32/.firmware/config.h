@@ -68,8 +68,10 @@
 #define PIN_MCP_MISO 19
 #define PIN_MCP_MOSI 23
 
-// MCP2515 oscillator: common Chinese modules use 8 MHz
-#define MCP_CRYSTAL_MHZ  MCP_8MHZ   // from autowp-mcp2515 CAN_CLOCK enum
+// MCP2515 oscillator (megahertz). The Mcp2515Pins struct translates this to
+// the autowp CAN_CLOCK enum internally so callers don't need to include the
+// driver header. Common Chinese MCP2515 modules and the T-2CAN V1.0 use 8 MHz.
+#define MCP_CRYSTAL_HZ_DEFAULT  8u
 
 // ── Timing ────────────────────────────────────────────────────────────────────
 #define WIRING_WARN_MS        5000u   // Red LED / serial warning if no CAN after this
@@ -94,6 +96,44 @@
   #define ME2107_EN 16
 #endif
 
+// ── T-2CAN V1.0 (ESP32-S3, dual-bus) ──────────────────────────────────────────
+// One MCP2515 over SPI + one ESP32-S3 TWAI peripheral with external
+// transceiver. Per LilyGO pin_config.h.
+#if defined(BOARD_LILYGO_T2CAN)
+  // TWAI ("Can B") pins
+  #undef  PIN_CAN_TX
+  #undef  PIN_CAN_RX
+  #define PIN_CAN_TX   7
+  #define PIN_CAN_RX   6
+  // MCP2515 ("Can A") pins — override the generic defaults above
+  #undef  PIN_MCP_CS
+  #undef  PIN_MCP_SCK
+  #undef  PIN_MCP_MISO
+  #undef  PIN_MCP_MOSI
+  #define PIN_MCP_CS    10
+  #define PIN_MCP_SCK   12
+  #define PIN_MCP_MOSI  11
+  #define PIN_MCP_MISO  13
+  #define PIN_MCP_INT    8   // RTC-capable on ESP32-S3 → EXT1 wake target
+  #define PIN_MCP_RST    9
+  // T-2CAN V1.0 has no user-controllable RGB LED. The generic default
+  // PIN_LED=27 collides with the internal QIO flash interface on
+  // ESP32-S3-WROOM-1 (GPIO 26-32 are reserved for flash), so driving it as
+  // a NeoPixel during led_init() corrupts flash access and triggers a
+  // TG1WDT_SYS_RST reset loop. Point at a free user GPIO instead — the
+  // NeoPixel bit-stream goes nowhere and the firmware boots cleanly.
+  #undef  PIN_LED
+  #define PIN_LED       21
+#endif
+
+// Bus count — 2 for dual builds, 1 otherwise. Drives g_can[] array sizing
+// and per-bus state in the dashboard.
+#if defined(CAN_DRIVER_DUAL)
+  #define CAN_BUS_COUNT 2
+#else
+  #define CAN_BUS_COUNT 1
+#endif
+
 // ── Deep sleep ────────────────────────────────────────────────────────────────
 // Two strategies, selected per board:
 //   SLEEP_STRATEGY_EXT0  — wake on CAN_RX edge. Needs PIN_CAN_RX on an
@@ -105,12 +145,19 @@
 //                          traffic. Works on any board. Used by M5Stack ATOM
 //                          variants whose ATOMIC CAN Base routes RX to GPIO 19
 //                          (not RTC-capable, so EXT0 is unavailable).
+//   SLEEP_STRATEGY_EXT1  — wake on ANY of several RTC pins (ESP32-S3 only).
+//                          T-2CAN uses this to wake on either the TWAI RX
+//                          edge or the MCP2515 INT line, so traffic on
+//                          either bus brings the chip out of deep sleep
+//                          with zero polling overhead.
 // Both ATOM Lite and ATOM Matrix share the ATOMIC CAN Base wiring (RX on
 // GPIO 19, not RTC-capable), so neither can use EXT0-on-CAN_RX. Both opt
 // into the timer-poll strategy. To disable sleep on a permanently-powered
 // dev setup, raise sleep_idle_ms via the web dashboard (max 3600 s).
 #if defined(BOARD_LILYGO)
   #define SLEEP_STRATEGY_EXT0 1
+#elif defined(BOARD_LILYGO_T2CAN)
+  #define SLEEP_STRATEGY_EXT1 1
 #elif defined(BOARD_M5STACK_ATOM) || defined(BOARD_M5STACK_ATOM_MATRIX)
   #define SLEEP_STRATEGY_TIMER 1
 #endif

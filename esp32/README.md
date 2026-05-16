@@ -111,6 +111,7 @@ Any ESP32 board + CAN transceiver works. Pick the matching build env in `platfor
 | `esp32-mcp2515` | Generic ESP32 + MCP2515 module | MCP2515 SPI | SPI CS=5 | 8 MHz crystal |
 | `esp32-lilygo` | LilyGO T-CAN485 | TWAI | 27 / 26 | Built-in SN65HVD230 + SD slot |
 | `waveshare-s3-can` | Waveshare ESP32-S3-RS485-CAN | TWAI | 15 / 16 | ESP32-S3, 8MB flash/PSRAM, USB-CDC |
+| `t-2can-v1` | LILYGO T-2CAN V1.0 | **dual: MCP2515 + TWAI** | bus 0: SPI CS=10/INT=8 · bus 1: 7/6 | ESP32-S3, 16MB flash, EXT1 wake-on-either-bus. Only the V1.0 (MCP2515); the Fd V1.0 (MCP2518FD) is not supported. |
 | generic | ESP32-C3/S3 Super Mini + SN65HVD230 | TWAI | any two pins | Override `PIN_CAN_TX` / `PIN_CAN_RX` |
 
 Build + upload:

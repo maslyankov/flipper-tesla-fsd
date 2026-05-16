@@ -21,9 +21,18 @@
 #include <esp_partition.h>
 
 // ── Module state ──────────────────────────────────────────────────────────────
-static FSDState  *g_state = nullptr;   // shared with main
-static CanDriver *g_can   = nullptr;   // for setListenOnly()
-static portMUX_TYPE *g_state_mux = nullptr;
+static FSDState         *g_state     = nullptr;   // shared with main
+static CanDriver *const *g_can       = nullptr;   // array of drivers from main
+static uint8_t           g_can_count = 0;
+static portMUX_TYPE     *g_state_mux = nullptr;
+
+// Helpers — dashboard treats all buses as one for the listen-only TX-arm.
+static void can_set_listen_only_all(bool listen_only) {
+    if (!g_can) return;
+    for (uint8_t i = 0; i < g_can_count; i++) {
+        if (g_can[i]) g_can[i]->setListenOnly(listen_only);
+    }
+}
 
 static WebServer        g_http(80);
 static WebSocketsServer g_ws(81);
@@ -335,6 +344,10 @@ input:checked+.sl2:before{transform:translateX(20px);background:#fff}
     <span class="lbl">Stalk → speed profile</span>
     <span id="stalkVal">--</span>
   </div>
+  <div id="busBlock" class="row" style="font-size:.85em;color:var(--text2);display:none">
+    <span class="lbl">Per-bus RX / err</span>
+    <span id="busList">--</span>
+  </div>
 </div>
 
 <!-- Vehicle live diagnostics -->
@@ -596,6 +609,17 @@ function upd(d){
 
   // CAN stats
   if(document.getElementById('rxCnt')) document.getElementById('rxCnt').textContent=(d.rx_count||0).toLocaleString();
+  // Per-bus stats — only shown on dual-bus builds. Hides itself on single-bus
+  // envs so the existing rxCnt / crcErr tiles remain the canonical readout.
+  if(d.buses && d.buses.length > 1) {
+    var bb=document.getElementById('busBlock'), bl=document.getElementById('busList');
+    if(bb && bl) {
+      bb.style.display='';
+      bl.textContent = d.buses.map(function(b,i){
+        return 'bus'+i+'('+b.name+'): '+(b.rx||0).toLocaleString()+' / '+(b.err||0);
+      }).join('   ');
+    }
+  }
   if(document.getElementById('txCnt')) document.getElementById('txCnt').textContent=(d.tx_count||0).toLocaleString();
   if(document.getElementById('crcErr')) document.getElementById('crcErr').textContent=d.crc_errors||0;
   if(document.getElementById('fps')) document.getElementById('fps').textContent=(d.fps||0.0).toFixed(1);
@@ -967,6 +991,16 @@ static String build_json() {
     j += "\"rx_count\":";      j += state.rx_count;                    j += ',';
     j += "\"tx_count\":";      j += state.frames_modified;             j += ',';
     j += "\"crc_errors\":";    j += state.crc_err_count;               j += ',';
+    j += "\"buses\":[";
+    for (uint8_t i = 0; i < g_can_count; i++) {
+        if (i) j += ',';
+        j += "{\"name\":\"";
+        j += (g_can && g_can[i]) ? g_can[i]->name() : "?";
+        j += "\",\"rx\":";  j += state.rx_count_bus[i];
+        j += ",\"err\":";   j += state.err_count_bus[i];
+        j += '}';
+    }
+    j += "],";
     j += "\"fps\":";           j += fps_s;                             j += ',';
     j += "\"bms\":";           j += bms;                               j += ',';
     j += "\"uptime_s\":";      j += uptime_s;                          j += ',';
@@ -1016,7 +1050,7 @@ static void ws_event(uint8_t num, WStype_t type,
         }
         saved = *g_state;
         state_exit();
-        if (g_can) g_can->setListenOnly(!active);
+        can_set_listen_only_all(!active);
         Serial.println(active ? "[Web] → Active mode" : "[Web] → Listen-Only mode");
         prefs_save(&saved);
     } else if (strstr(buf, "\"nag\"")) {
@@ -1372,9 +1406,12 @@ static void handle_ota_done() {
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
-void web_dashboard_init(FSDState *state, CanDriver *can, portMUX_TYPE *state_mux) {
+void web_dashboard_init(FSDState *state,
+                        CanDriver *const *can, uint8_t can_count,
+                        portMUX_TYPE *state_mux) {
     g_state       = state;
     g_can         = can;
+    g_can_count   = can_count;
     g_state_mux   = state_mux;
     g_start_ms    = millis();
     g_last_fps_ms = millis();

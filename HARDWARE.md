@@ -7,7 +7,7 @@
 | **Any ESP32 + MCP2515 → X179** | **~$5-7** | X179 4-wire | 1 (bus 6 = mixed) | Yes | Cheapest full-feature setup |
 | M5Stack ATOM Lite + ATOMIC CAN → X179 | ~$13-15 | X179 4-wire | 1 (bus 6) | Yes | Plug & play, no soldering |
 | M5Stack ATOM Matrix + ATOMIC CAN → X179 | ~$22-25 | X179 4-wire | 1 (bus 6) | Yes | 5×5 LED status, timer-poll deep sleep |
-| **LILYGO T-2CAN ESP32-S3** → X179 | **~$24** | X179 4-wire (+ spare CAN2) | **2 independent** | Yes | Future-proof, dual-CAN ready |
+| **LILYGO T-2CAN ESP32-S3 V1.0** → X179 + Party | **~$24** | 2× 4-wire (Chassis + Party) | **2 independent (MCP2515 + TWAI)** | Yes | Dual-bus build (env `t-2can-v1`) with EXT1 wake-on-CAN |
 | **LILYGO T-CAN485** → X179 | **~$15** | X179 4-wire | 1 (SN65HVD230) | Yes | SD card CAN dump, tested on Model X/S |
 | Waveshare ESP32-S3-RS485-CAN → X179 | ~$18 | X179 4-wire | 1 (TWAI) | Yes | All-in-one board |
 | Flipper Zero + Electronic Cats CAN Add-On → OBD-II | ~$234 | OBD-II plug | 1 (Party CAN) | No | If you already own a Flipper |
@@ -271,21 +271,52 @@ Build with `pio run -e esp32-mcp2515`, adjust pin config in
 ATOMIC CAN Base snaps onto the ATOM Lite. Solder X179 CAN-H/CAN-L to
 the screw terminals, 12V to VIN, GND to GND. Build: `pio run -e esp32-twai`.
 
-### Setup C — LILYGO T-2CAN dual-CAN (~$33)
+### Setup C — LILYGO T-2CAN dual-bus (~$33)
 
 | Component | Price |
 |-----------|-------|
-| [LILYGO T-2CAN ESP32-S3](https://lilygo.cc/products/t-2can) | ~$24 |
-| X179 pigtail cable (4-wire) | ~$3-5 |
-| **Total** | **~$27-29** |
+| [LILYGO T-2CAN ESP32-S3 V1.0](https://lilygo.cc/products/t-2can) | ~$24 |
+| 2× X179 pigtail cable (4-wire) or one X179 + one OBD-II pigtail | ~$5-10 |
+| **Total** | **~$29-34** |
 
-The T-2CAN has **dual isolated MCP2515 controllers**, dual screw
-terminals, 12–24V input, WiFi, BLE, QWIIC, and USB-C. Connect X179
-to CAN1 screw terminal. CAN2 stays free for future use (e.g., OBD-II
-Party CAN for redundancy, or a second X179 bus pair).
+T-2CAN V1.0 carries **two independent CAN controllers** on one PCB —
+**not** two MCP2515s as earlier docs claimed. Per LilyGO's official
+[pin\_config.h](https://github.com/Xinyuan-LilyGO/T-2CAN/blob/main/libraries/private_library/pin_config.h):
 
-This is the recommended board for anyone who wants headroom for
-dual-bus features in a future firmware update.
+| Bus | Controller | Pins | Driver flag |
+|-----|------------|------|-------------|
+| **Can A** | MCP2515 over SPI | CS=10, SCK=12, MOSI=11, MISO=13, INT=8, RST=9 (8 MHz crystal) | `CAN_DRIVER_MCP2515` |
+| **Can B** | ESP32-S3 built-in TWAI (external transceiver) | TX=7, RX=6 | `CAN_DRIVER_TWAI` |
+
+The `Fd V1.0` variant ships an **MCP2518FD** on the SPI side (CAN-FD,
+not compatible with this firmware's `autowp/autowp-mcp2515` driver).
+Confirm the silkscreen reads `T-2Can V1.0`, not `T-2Can-Fd V1.0`,
+before flashing the `t-2can-v1` env.
+
+Build: `pio run -e t-2can-v1`. This env defines `CAN_DRIVER_DUAL`,
+so both drivers are compiled in and both buses are polled every loop
+iteration. TX echoes (NAG, TLSSC, 0x3FD modification) target the same
+bus the source frame arrived on; self-initiated TX (precondition inject)
+defaults to **bus 0 (MCP2515)**.
+
+#### Recommended wiring
+
+| Wire | Target | Why |
+|------|--------|-----|
+| **Bus 0 (MCP2515)** — Can A screw terminal | Chassis CAN (X179 Pins 13/14, or enhauto Commander Chassis pair) | Has a dedicated `INT` pin for EXT1 wake-on-CAN — the bus most likely to be silent while the car is asleep benefits from the lowest-latency wake source. |
+| **Bus 1 (TWAI)** — Can B screw terminal | Party CAN (OBD-II Pins 6/14) or a second X179 tap | The TWAI RX pin (GPIO 6) is also RTC-capable, so the same EXT1 wake mask covers both buses. |
+
+Sharing a single 12V/GND supply for both screw terminals is fine
+because the car's buses share a common chassis ground.
+
+#### Deep sleep
+
+T-2CAN uses `SLEEP_STRATEGY_EXT1` — `esp_sleep_enable_ext1_wakeup()`
+with both `PIN_CAN_RX` (TWAI) and `PIN_MCP_INT` (MCP2515) in the wake
+mask, polarity `ESP_EXT1_WAKEUP_ANY_LOW`. Traffic on **either** bus
+ends sleep, no polling required. The MCP2515 keeps its default
+interrupt enables (RX0IE+RX1IE) so a received frame on Bus 0 pulls
+GPIO 8 LOW and wakes the SoC just like a TWAI RX edge on GPIO 6.
 
 ### Setup D — Flipper Zero + CAN Add-On (~$210)
 
@@ -320,7 +351,7 @@ resistor enabled — disable it before connecting to the car.
 - **Electronic Cats Add-On v0.2+**: ships disabled, no action needed
 - **Generic MCP2515 modules**: find and remove `R4` or `J1`
 - **M5Stack ATOMIC CAN Base**: no termination by default
-- **LILYGO T-2CAN**: check documentation
+- **LILYGO T-2CAN V1.0**: termination state per the published schematic is not confirmed by this PR's author — measure each screw terminal with the board off-car before connecting (see the verify step below).
 
 Verify: measure resistance between CAN-H and CAN-L with the module
 disconnected from the car. ~120 Ω = good (terminator off, car provides
